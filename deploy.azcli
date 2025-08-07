@@ -5,8 +5,10 @@ source venv/bin/activate
 pip install -r requirements.txt
 uvicorn main:app --reload
 
-## Clean and Deploy
+## Clean 
 rm -rf __pycache__ venv .venv www-cbrtc-api.zip
+
+## Zip and Deploy
 zip -r www-cbrtc-api.zip .  
 az webapp deployment source config-zip --resource-group rg-prod-workload --name cbrtcapi --src www-cbrtc-api.zip
 az webapp config set --name cbrtcapi --resource-group rg-prod-workload --startup-file "gunicorn -w 4 -k uvicorn.workers.UvicornWorker main:app"
