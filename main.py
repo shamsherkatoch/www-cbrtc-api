@@ -8,6 +8,14 @@ from azure.identity import ManagedIdentityCredential
 
 app = FastAPI()
 
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return FileResponse("static/favicon.ico")
+
+@app.get("/")
+async def root():
+    return {"message": "FastAPI backend is running"}
+
 # --- CORS: support one or many origins via comma-separated env var ---
 SWA_ORIGIN = os.getenv(
     "SWA_ORIGIN",
