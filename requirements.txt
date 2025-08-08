@@ -1,3 +1,24 @@
-fastapi
-uvicorn
-gunicorn
+fastapi~=0.115
+uvicorn[standard]~=0.30
+gunicorn~=22.0
+
+# Auth to Microsoft Graph via Managed Identity
+azure-identity~=1.17
+
+# HTTP to Graph
+requests~=2.32
+
+# Validation helpers (needed for EmailStr, etc.)
+email-validator~=2.2
+pydantic~=2.8
+
+# Rate limiting (if you add it)
+slowapi~=0.1.9
+
+# CORS isn’t extra (comes via Starlette in FastAPI)
+
+# If you choose Azure Communication Services (instead of Graph)
+azure-communication-email~=1.0
+
+# App Insights (OpenTelemetry way)
+azure-monitor-opentelemetry~=1.6

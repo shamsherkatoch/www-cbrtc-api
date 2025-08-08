@@ -1,69 +1,83 @@
-from fastapi import FastAPI, Request
-from fastapi import Form
+# main.py
+from typing import Optional
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import smtplib
-from email.message import EmailMessage
-import os
+from pydantic import BaseModel, EmailStr, Field, constr
+import os, requests
+from azure.identity import ManagedIdentityCredential
 
 app = FastAPI()
 
-@app.get("/favicon.ico", include_in_schema=False)
-async def favicon():
-    return FileResponse("static/favicon.ico")
+# --- CORS: support one or many origins via comma-separated env var ---
+SWA_ORIGIN = os.getenv(
+    "SWA_ORIGIN",
+    "https://salmon-coast-0bb767a00.5.azurestaticapps.net, https://www.cbrtc.com.au"
+)
+ALLOW_ORIGINS = [o.strip() for o in SWA_ORIGIN.split(",") if o.strip()]
 
-# Add CORS middleware here
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://salmon-coast-0bb767a00.5.azurestaticapps.net","https://www.cbrtc.com.au"],  # Or ["*"] during testing
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=ALLOW_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
-@app.get("/")
-async def root():
-    return {"message": "FastAPI backend is running"}
+# --- Model (Python 3.8/3.9 safe) ---
+class Contact(BaseModel):
+    name: constr(strip_whitespace=True, min_length=1, max_length=100)
+    email: EmailStr
+    message: constr(strip_whitespace=True, min_length=5, max_length=4000)
+    phone: Optional[constr(strip_whitespace=True, max_length=40)] = None
+    website: Optional[str] = None  # honeypot
 
-class ContactForm(BaseModel):
-    senderName: str
-    senderEmail: str
-    message: str
+# --- Email via Microsoft Graph using Managed Identity ---
+GRAPH_SCOPE = "https://graph.microsoft.com/.default"
+MAILBOX_UPN = os.getenv("MAILBOX_UPN")  # shared mailbox or user UPN
+credential = ManagedIdentityCredential()
 
-""" @app.post("/send-contact-email")
-async def send_contact_email(form: ContactForm):
-    msg = EmailMessage()
-    msg["Subject"] = f"Contact Form Submission from {form.senderName}"
-    msg["From"] = os.environ["O365_USER"]
-    msg["To"] = os.environ["CONTACT_RECEIVER"]
-    msg.set_content(f"Name: {form.senderName}\nEmail: {form.senderEmail}\n\nMessage:\n{form.message}")
+def send_mail_via_graph(subject: str, body_html: str, reply_to: str):
+    if not MAILBOX_UPN:
+        raise HTTPException(status_code=500, detail="MAILBOX_UPN not configured")
+    token = credential.get_token(GRAPH_SCOPE).token
+    url = f"https://graph.microsoft.com/v1.0/users/{MAILBOX_UPN}/sendMail"
+    payload = {
+        "message": {
+            "subject": subject,
+            "body": {"contentType": "HTML", "content": body_html},
+            "toRecipients": [{"emailAddress": {"address": MAILBOX_UPN}}],
+            "replyTo": [{"emailAddress": {"address": reply_to}}],
+        },
+        "saveToSentItems": True,
+    }
+    resp = requests.post(
+        url,
+        json=payload,
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=15,
+    )
+    if resp.status_code not in (200, 202):
+        raise HTTPException(status_code=500, detail=f"Graph sendMail failed: {resp.text}")
 
-    try:
-        with smtplib.SMTP("smtp.office365.com", 587) as smtp:
-            smtp.starttls()
-            smtp.login(os.environ["O365_USER"], os.environ["O365_PASS"])
-            smtp.send_message(msg)
-        return {"status": "success"}
-    except Exception as e:
-        return {"status": "error", "detail": str(e)} """
+@app.post("/contact")
+def contact(c: Contact):
+    # Honeypot: bots fill hidden field; we pretend success
+    if c.website:
+        return {"status": "ok"}
 
-@app.post("/send-contact-email")
-async def send_contact_email(
-    senderName: str = Form(...),
-    senderEmail: str = Form(...),
-    message: str = Form(...)
-):
-    msg = EmailMessage()
-    msg["Subject"] = f"Contact Form Submission from {senderName}"
-    msg["From"] = os.environ["O365_USER"]
-    msg["To"] = os.environ["CONTACT_RECEIVER"]
-    msg.set_content(f"Name: {senderName}\nEmail: {senderEmail}\n\nMessage:\n{message}")
+    # Avoid backslash-in-fstring issues
+    message_html = c.message.replace("\n", "<br/>")
+    body_html = (
+        f"<p><b>Name:</b> {c.name}</p>"
+        f"<p><b>Email:</b> {c.email}</p>"
+        f"<p><b>Phone:</b> {c.phone or '-'}</p>"
+        f"<p><b>Message:</b><br/>{message_html}</p>"
+    )
 
-    try:
-        with smtplib.SMTP("smtp.office365.com", 587) as smtp:
-            smtp.starttls()
-            smtp.login(os.environ["O365_USER"], os.environ["O365_PASS"])
-            smtp.send_message(msg)
-        return {"status": "success"}
-    except Exception as e:
-        return {"status": "error", "detail": str(e)}
+    # Send email
+    send_mail_via_graph(
+        subject=f"New website enquiry from {c.name}",
+        body_html=body_html,
+        reply_to=c.email,
+    )
+    return {"status": "ok"}
