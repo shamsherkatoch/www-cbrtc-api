@@ -1,90 +1,99 @@
-# main.py
-from typing import Optional
-from fastapi import FastAPI, HTTPException
+import os, html, time
+from typing import Optional, Dict
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr, Field, constr
-import os, requests
+from pydantic import BaseModel, EmailStr, Field
 from azure.identity import ManagedIdentityCredential
+from azure.keyvault.secrets import SecretClient
+import httpx 
 
 app = FastAPI()
 
-@app.get("/favicon.ico", include_in_schema=False)
-async def favicon():
-    return FileResponse("static/favicon.ico")
-
-@app.get("/")
-async def root():
-    return {"message": "FastAPI backend is running"}
-
-# --- CORS: support one or many origins via comma-separated env var ---
-SWA_ORIGIN = os.getenv("SWA_ORIGIN",
-    "http://127.0.0.1:5501/"
-)
-ALLOW_ORIGINS = [o.strip() for o in SWA_ORIGIN.split(",") if o.strip()]
-
+# --- CORS (keep or remove if you proxy via SWA /api/*) ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOW_ORIGINS,
-    allow_credentials=False,
+    allow_origins=[
+        "https://salmon-coast-0bb767a00.5.azurestaticapps.net",
+        "https://www.cbrtc.com.au"
+    ],
     allow_methods=["POST", "OPTIONS"],
-    allow_headers=["*"],
+    allow_headers=["Content-Type", "cf-turnstile-response"],
 )
 
-# --- Model (Python 3.8/3.9 safe) ---
-class Contact(BaseModel):
-    name: constr(strip_whitespace=True, min_length=1, max_length=100)
-    email: EmailStr
-    message: constr(strip_whitespace=True, min_length=5, max_length=4000)
-    phone: Optional[constr(strip_whitespace=True, max_length=40)] = None
-    website: Optional[str] = None  # honeypot
+# --- UAMI + Key Vault ---
+UAMI_CLIENT_ID = os.environ["AZURE_CLIENT_ID"]            # UAMI client id
+KEYVAULT_URL   = os.environ["KEYVAULT_URL"]               # Key Vault
 
-# --- Email via Microsoft Graph using Managed Identity ---
+cred = ManagedIdentityCredential(client_id=UAMI_CLIENT_ID)
+kv  = SecretClient(vault_url=KEYVAULT_URL, credential=cred)
+
+# Simple in-process cache so we don’t hit KV every request
+_SECRET_CACHE: Dict[str, Dict[str, str]] = {}
+_CACHE_TTL_SECONDS = 300
+
+def get_secret(name: str) -> str:
+    now = time.time()
+    entry = _SECRET_CACHE.get(name)
+    if entry and now - entry["ts"] < _CACHE_TTL_SECONDS:
+        return entry["val"]
+    try:
+        val = kv.get_secret(name).value  # no version => always latest
+        _SECRET_CACHE[name] = {"val": val, "ts": now}
+        return val
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Key Vault read failed for '{name}': {e}")
+
+# Graph constants
 GRAPH_SCOPE = "https://graph.microsoft.com/.default"
-MAILBOX_UPN = os.getenv("MAILBOX_UPN")  # shared mailbox or user UPN
-credential = ManagedIdentityCredential()
 
-def send_mail_via_graph(subject: str, body_html: str, reply_to: str):
-    if not MAILBOX_UPN:
-        raise HTTPException(status_code=500, detail="MAILBOX_UPN not configured")
-    token = credential.get_token(GRAPH_SCOPE).token
-    url = f"https://graph.microsoft.com/v1.0/users/{MAILBOX_UPN}/sendMail"
+class ContactIn(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+    email: EmailStr
+    message: str = Field(..., min_length=1, max_length=8000)
+    phone: Optional[str] = Field(None, max_length=100)
+
+async def send_mail_via_graph(subject: str, body_html: str, reply_to: Optional[str] = None):
+    sender_upn = get_secret("Graph-Sender-Upn")
+    contact_to = get_secret("Contact-To")
+
+    # Acquire Graph token using UAMI
+    try:
+        token = cred.get_token(GRAPH_SCOPE).token
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Managed Identity auth failed: {e}")
+
+    url = f"https://graph.microsoft.com/v1.0/users/{sender_upn}/sendMail"
     payload = {
         "message": {
-            "subject": subject,
+            "subject": subject[:255],
             "body": {"contentType": "HTML", "content": body_html},
-            "toRecipients": [{"emailAddress": {"address": MAILBOX_UPN}}],
-            "replyTo": [{"emailAddress": {"address": reply_to}}],
+            "toRecipients": [{"emailAddress": {"address": contact_to}}],
         },
-        "saveToSentItems": True,
+        "saveToSentItems": "false"
     }
-    resp = requests.post(
-        url,
-        json=payload,
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=15,
-    )
-    if resp.status_code not in (200, 202):
-        raise HTTPException(status_code=500, detail=f"Graph sendMail failed: {resp.text}")
+    if reply_to:
+        payload["message"]["replyTo"] = [{"emailAddress": {"address": reply_to}}]
+
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(url, headers=headers, json=payload)
+
+    if r.status_code >= 300:
+        raise HTTPException(status_code=502, detail=f"Graph send failed: {r.status_code} {r.text}")
 
 @app.post("/contact")
-def contact(c: Contact):
-    # Honeypot: bots fill hidden field; we pretend success
-    if c.website:
-        return {"status": "ok"}
-
-    # Avoid backslash-in-fstring issues
-    message_html = c.message.replace("\n", "<br/>")
-    body_html = (
-        f"<p><b>Name:</b> {c.name}</p>"
-        f"<p><b>Email:</b> {c.email}</p>"
-        f"<p><b>Phone:</b> {c.phone or '-'}</p>"
-        f"<p><b>Message:</b><br/>{message_html}</p>"
+async def contact(c: ContactIn, cf_turnstile_response: Optional[str] = Header(None)):
+    # (Optional) verify Turnstile: secret = get_secret("Turnstile-Secret") and call Cloudflare siteverify
+    msg_html = "<br/>".join(html.escape(line) for line in c.message.splitlines())
+    body = (
+        f"<p><b>Name:</b> {html.escape(c.name)}</p>"
+        f"<p><b>Email:</b> {html.escape(c.email)}</p>"
+        f"<p><b>Phone:</b> {html.escape(c.phone) if c.phone else '-'}</p>"
+        f"<p><b>Message:</b><br/>{msg_html}</p>"
     )
-
-    # Send email
-    send_mail_via_graph(
-        subject=f"New website enquiry from {c.name}",
-        body_html=body_html,
-        reply_to=c.email,
+    await send_mail_via_graph(
+        subject=f"Website enquiry from {c.name}",
+        body_html=body,
+        reply_to=c.email
     )
-    return {"status": "ok"}
+    return {"ok": True}
