@@ -17,9 +17,8 @@ async def root():
     return {"message": "FastAPI backend is running"}
 
 # --- CORS: support one or many origins via comma-separated env var ---
-SWA_ORIGIN = os.getenv(
-    "SWA_ORIGIN",
-    "https://salmon-coast-0bb767a00.5.azurestaticapps.net, https://www.cbrtc.com.au"
+SWA_ORIGIN = os.getenv("SWA_ORIGIN",
+    "http://127.0.0.1:5501/"
 )
 ALLOW_ORIGINS = [o.strip() for o in SWA_ORIGIN.split(",") if o.strip()]
 
